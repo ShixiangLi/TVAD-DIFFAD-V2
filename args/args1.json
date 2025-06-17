@@ -1,0 +1,67 @@
+{
+  "img_size": [64, 64],
+  "channels": 3,
+  "Batch_Size": 64,
+  "eval_batch_size": 64,
+  "EPOCHS": 70,
+  "T": 1000,
+  "seed": 42,
+
+  "base_channels": 32,
+  "channel_mults": [1, 2, 3, 4],
+  "dropout": 0.0,
+  "attention_resolutions": "8,4",
+  "num_heads": 4,
+  "num_head_channels": -1,
+
+  "beta_schedule": "linear",
+  "loss-type": "l2",
+  "loss_weight": "none",
+  "noise_fn": "gauss",
+
+  "diffusion_lr": 1e-4,
+  "seg_lr": 1e-5,
+  "weight_decay": 0.0,
+
+  "scheduler_T_max": 100,
+  "scheduler_eta_min": 0,
+  "focal_loss_weight": 5.0,
+  "sml1_loss_weight": 1.0,
+
+  "noisier_t_range": 600,
+  "less_t_range": 300,
+  "condition_w": 1.0,
+
+  "eval_normal_t": 200,
+  "eval_noisier_t": 400,
+  "eval_every_epochs": 5,
+  "log_loss_every_epochs": 5,
+  "image_score_top_k": 50,
+
+  "output_path": "outputs",
+  "num_workers_train": 4,
+  "num_workers_eval": 2,
+
+  "dataset_type_to_run": "Custom",
+  "custom_dataset_root_path": "datasets/combustion_dataset",
+  "custom_dataset_classes": ["chamber"],
+
+  "mvtec_root_path": "datasets/mvtec_anomaly_detection",
+  "mvtec_classes": ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut", "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"],
+  "visa_root_path": "datasets/VisA",
+  "visa_classes": ["candle", "capsules", "cashew", "chewinggum", "fryum", "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum"],
+  "mpdd_root_path": "datasets/MPDD",
+  "mpdd_classes": ["bracket_black", "bracket_brown", "bracket_white", "connector", "metal_plate", "tubes"],
+  "dagm_root_path": "datasets/DAGM",
+  "dagm_classes": ["Class1", "Class2", "Class3", "Class4", "Class5", "Class6", "Class7", "Class8", "Class9", "Class10"],
+
+  "anomaly_source_path": "datasets/DTD",
+
+  "save_visualizations_eval": true,
+  "num_viz_to_save": 1000,
+  "viz_gaussian_sigma": 4,
+
+  "random_slice": true,
+  "save_imgs": true,
+  "save_vids": false
+}

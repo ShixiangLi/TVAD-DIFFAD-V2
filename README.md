@@ -1,2 +1,2 @@
-# TVAD-DIFFAD-V2
-传感数据改成多步，每一段对应一帧图像
+# TVAD-DIFFAD
+生成模型进行异常检测（DIFFAD架构）
