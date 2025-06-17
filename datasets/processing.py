@@ -5,9 +5,9 @@ import sys
 import random
 
 # --- 配置参数 ---
-VIDEO_DATA_PATH = 'datasets/raw_data/video_data.npy'  # 图像数据 .npy 文件路径 (N, H, W, C)
+VIDEO_DATA_PATH = 'datasets/raw_data/video_data.npy'  # 图像数据 .npy 文件路径 (N, C, H, W)
 LABEL_DATA_PATH = 'datasets/raw_data/labels.npy'      # 标签数据 .npy 文件路径 (N, H, W)
-CURRENT_DATA_PATH = 'datasets/raw_data/current_data.npy' # 新增：电流数据 .npy 文件路径 (N, 3)
+CURRENT_DATA_PATH = 'datasets/raw_data/current_data.npy' # 新增：电流数据 .npy 文件路径 (N, 24, 3)
 
 # --- 输出目录结构参数 ---
 OUTPUT_BASE_DIR = 'datasets/combustion_dataset/chamber' 
@@ -31,7 +31,7 @@ FILENAME_PREFIX = 'frame'    # 输出文件名的前缀
 NUM_TEST_NORMAL = 2000        # 测试集中正常样本数量
 NUM_TEST_ABNORMAL = 2000      # 测试集中异常样本数量
 
-DEFAULT_ANOMALY_CLASS_NAME = 'anomaly' # 默认异常类别文件夹名，如果只有一个类别，如 'burn'
+DEFAULT_ANOMALY_CLASS_NAME = 'anomaly' # 默认异常类别文件夹名
 # ----------------
 
 def process_and_split_data_custom(video_path, label_path, current_data_path,
@@ -44,7 +44,7 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
                                   num_test_normal, num_test_abnormal,
                                   prefix):
     """
-    加载图像(N, H, W, C)、标签(N, H, W)和电流数据(N, 3)，
+    加载图像(N, C, H, W)、标签(N, H, W)和电流数据(N, 24, 3)，
     按指定数量随机分割为训练/测试集，并将图像/掩码保存为 PNG，电流特征保存为 .npy。
     """
     print(f"开始自定义处理与分割...")
@@ -86,9 +86,9 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
         print(f"加载电流数据时出错: {e}")
         sys.exit(1)
 
-    # --- 2. 验证数据维度 ---
+    # --- 2. 验证数据维度 (MODIFIED FOR N, C, H, W) ---
     if video_data.ndim != 4:
-        print(f"错误: 图像数据的维度必须为 4 (N, H, W, C)。实际维度: {video_data.ndim}")
+        print(f"错误: 图像数据的维度必须为 4 (N, C, H, W)。实际维度: {video_data.ndim}")
         sys.exit(1)
     if label_data.ndim != 3:
         print(f"错误: 标签数据的维度必须为 3 (N, H, W)。实际维度: {label_data.ndim}")
@@ -97,7 +97,7 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
         print(f"错误: 电流数据的维度必须为 3 (N, 24, 3)。实际维度: {current_data.shape}")
         sys.exit(1)
 
-    N_img, H_img, W_img, C_img = video_data.shape
+    N_img, C_img, H_img, W_img = video_data.shape # MODIFIED: Unpack N, C, H, W
     N_lbl = label_data.shape[0]
     N_curr = current_data.shape[0]
 
@@ -106,11 +106,11 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
         sys.exit(1)
     N = N_img
 
-    if H_img != label_data.shape[1] or W_img != label_data.shape[2]: # Ensure H, W match for label_data
+    if H_img != label_data.shape[1] or W_img != label_data.shape[2]:
         print("警告: 图像数据和标签数据的空间维度 (H, W) 不匹配。将使用图像维度。")
     H, W = H_img, W_img
 
-    print(f"总样本数 (N): {N}, 图像尺寸: ({H}, {W}, {C_img}), 电流特征维度: ({current_data.shape[1]})")
+    print(f"总样本数 (N): {N}, 图像尺寸: ({C_img}, {H}, {W}), 电流特征维度: ({current_data.shape[1]}, {current_data.shape[2]})")
 
     # --- 3. 创建输出目录 ---
     actual_test_anomaly_img_dir = os.path.join(test_anomaly_img_dir_base, anomaly_class_name)
@@ -158,13 +158,13 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
     train_normal_indices = normal_indices[actual_num_test_normal:]
     print(f"剩余 {len(train_normal_indices)} 个正常样本作为训练集。")
 
-    # --- 7. 保存文件 ---
+    # --- 7. 保存文件 (MODIFIED FOR N, C, H, W and Bug Fix) ---
     num_digits = len(str(N - 1)) 
 
     # 保存训练集正常样本 (图像、电流特征)
     print("\n正在保存训练集正常样本...")
     for i, original_idx in enumerate(train_normal_indices):
-        img_slice = video_data[original_idx]
+        img_slice_chw = video_data[original_idx] # Shape (C, H, W)
         current_feature_vector = current_data[original_idx] 
 
         base_filename_img = f"{prefix}_{original_idx:0{num_digits}d}.png"
@@ -173,14 +173,19 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
         image_save_path = os.path.join(train_good_img_dir, base_filename_img)
         current_feature_save_path = os.path.join(train_good_current_dir, base_filename_curr)
 
-        # 保存图像
         img_array = None
         mode = None
-        if C_img == 1: img_array = img_slice.squeeze(axis=-1); mode = 'L'
-        elif C_img == 3: img_array = img_slice; mode = 'RGB'
-        elif C_img == 4: img_array = img_slice; mode = 'RGBA'
-        elif C_img == 0: print(f"错误: 样本 {original_idx} 通道数为0"); continue
-        else: img_array = img_slice[:, :, 0]; mode = 'L'; print(f"警告: 图像通道数 {C_img} 未明确处理 ({original_idx})，默认使用第一通道转灰度图。")
+        if C_img == 1:
+            img_array = img_slice_chw.squeeze(axis=0); mode = 'L' # (1,H,W) -> (H,W)
+        elif C_img == 3:
+            img_array = img_slice_chw.transpose(1, 2, 0); mode = 'RGB' # (C,H,W) -> (H,W,C)
+        elif C_img == 4:
+            img_array = img_slice_chw.transpose(1, 2, 0); mode = 'RGBA' # (C,H,W) -> (H,W,C)
+        elif C_img == 0:
+            print(f"错误: 样本 {original_idx} 通道数为0"); continue
+        else:
+            img_array = img_slice_chw[0, :, :]; mode = 'L';
+            print(f"警告: 图像通道数 {C_img} 未明确处理 ({original_idx})，默认使用第一通道转灰度图。")
 
         if img_array is not None:
             if img_array.dtype != np.uint8:
@@ -205,7 +210,7 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
     # 保存测试集正常样本 (图像、全零掩码、电流特征)
     print("\n正在保存测试集正常样本及其掩码与电流特征...")
     for i, original_idx in enumerate(test_normal_indices):
-        img_slice = video_data[original_idx]
+        img_slice_chw = video_data[original_idx] # Shape (C, H, W)
         current_feature_vector = current_data[original_idx]
 
         base_filename_img = f"{prefix}_{original_idx:0{num_digits}d}.png"
@@ -216,11 +221,11 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
         current_feature_save_path = os.path.join(test_good_current_dir, base_filename_curr)
 
         img_array = None; mode = None
-        if C_img == 1: img_array = img_slice.squeeze(axis=-1); mode = 'L'
-        elif C_img == 3: img_array = img_slice; mode = 'RGB'
-        elif C_img == 4: img_array = img_slice; mode = 'RGBA'
+        if C_img == 1: img_array = img_slice_chw.squeeze(axis=0); mode = 'L'
+        elif C_img == 3: img_array = img_slice_chw.transpose(1, 2, 0); mode = 'RGB'
+        elif C_img == 4: img_array = img_slice_chw.transpose(1, 2, 0); mode = 'RGBA'
         elif C_img == 0: print(f"错误: 样本 {original_idx} 通道数为0"); continue
-        else: img_array = img_slice[:, :, 0]; mode = 'L';
+        else: img_array = img_slice_chw[0, :, :]; mode = 'L';
         
         if img_array is not None:
             if img_array.dtype != np.uint8:
@@ -242,7 +247,7 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
     # 保存测试集异常样本 (图像、二值掩码、电流特征)
     print("\n正在保存测试集异常样本及其掩码与电流特征...")
     for i, original_idx in enumerate(test_abnormal_indices):
-        img_slice = video_data[original_idx]
+        img_slice_chw = video_data[original_idx] # Shape (C, H, W)
         label_map = label_data[original_idx]
         current_feature_vector = current_data[original_idx]
 
@@ -254,11 +259,11 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
         current_feature_save_path = os.path.join(actual_test_anomaly_current_dir, base_filename_curr)
 
         img_array = None; mode = None
-        if C_img == 1: img_array = img_slice.squeeze(axis=-1); mode = 'L'
-        elif C_img == 3: img_array = img_slice; mode = 'RGB'
-        elif C_img == 4: img_array = img_slice; mode = 'RGBA'
+        if C_img == 1: img_array = img_slice_chw.squeeze(axis=0); mode = 'L'
+        elif C_img == 3: img_array = img_slice_chw.transpose(1, 2, 0); mode = 'RGB'
+        elif C_img == 4: img_array = img_slice_chw.transpose(1, 2, 0); mode = 'RGBA'
         elif C_img == 0: print(f"错误: 样本 {original_idx} 通道数为0"); continue
-        else: img_array = img_slice[:, :, 0]; mode = 'L';
+        else: img_array = img_slice_chw[0, :, :]; mode = 'L';
         
         if img_array is not None:
             if img_array.dtype != np.uint8:
@@ -286,14 +291,9 @@ def process_and_split_data_custom(video_path, label_path, current_data_path,
 
 
 if __name__ == "__main__":
-    # 假设只有一个异常类别 "burn"，与截图类似
-    # 如果您的数据有多个异常类别，或者标签本身能区分，您需要调整 anomaly_class_name 的处理逻辑
+    # 根据您的数据情况，定义异常类别文件夹的名称
+    # 例如，如果您的异常类别是 'burn'
     anomaly_folder_name = "burn" 
-    # 或者，如果您希望所有异常都放在一个名为 "defects" 的文件夹下：
-    # anomaly_folder_name = "defects" 
-    # 或者，如果您的 label_data 本身没有类别信息，统一叫 "anomaly"
-    # anomaly_folder_name = DEFAULT_ANOMALY_CLASS_NAME
-
 
     process_and_split_data_custom(
         video_path=VIDEO_DATA_PATH,
@@ -307,7 +307,7 @@ if __name__ == "__main__":
         train_good_current_dir=TRAIN_GOOD_CURRENT_DIR, 
         test_good_current_dir=TEST_GOOD_CURRENT_DIR,   
         test_anomaly_current_dir_base=TEST_ANOMALY_CURRENT_DIR_PREFIX, 
-        anomaly_class_name=anomaly_folder_name, # 这会创建如 test/burn, current_features/test/burn 等
+        anomaly_class_name=anomaly_folder_name,
         num_test_normal=NUM_TEST_NORMAL,
         num_test_abnormal=NUM_TEST_ABNORMAL,
         prefix=FILENAME_PREFIX
