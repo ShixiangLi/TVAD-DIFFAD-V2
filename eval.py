@@ -12,7 +12,7 @@ from models.Recon_subnetwork import UNetModel # update_ema_params not used here
 from models.Seg_subnetwork import SegmentationSubNetwork
 # import torch.nn as nn # Duplicated
 from data.dataset_beta_thresh import (
-    MVTecTestDataset, CustomTestDataset
+    CustomTestDataset
     # Train datasets not needed for eval.py
 )
 from models.DDPM import GaussianDiffusionModel, get_beta_schedule
@@ -659,7 +659,6 @@ def main():
 
     # Define dataset classes and paths (can be loaded from args or defined here)
     # These are examples; ensure they match your `args1.json` and project structure.
-    mvtec_classes_default = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']
     custom_dataset_classes_default = ['chamber'] # From original eval.py
     
     # Determine which set of classes to evaluate
@@ -748,15 +747,10 @@ def main():
         class_type_name = "Unknown"
 
         # Update these paths from your args_config
-        mvtec_root = args_config.get("mvtec_root_path", "path/to/mvtec")
         custom_root = args_config.get("custom_dataset_root_path", "path/to/custom")
 
 
-        if sub_class_item in args_config.get('mvtec_classes', mvtec_classes_default):
-            dataset_root_main = os.path.join(mvtec_root, sub_class_item)
-            TestDS_Class = MVTecTestDataset
-            class_type_name = 'MVTec'
-        elif sub_class_item in args_config.get('custom_dataset_classes', custom_dataset_classes_default):
+        if sub_class_item in args_config.get('custom_dataset_classes', custom_dataset_classes_default):
             dataset_root_main = os.path.join(custom_root, sub_class_item)
             TestDS_Class = CustomTestDataset
             class_type_name = 'Custom'

@@ -11,7 +11,6 @@ from models.Seg_subnetwork import SegmentationSubNetwork
 from tqdm import tqdm
 import torch.nn as nn
 from data.dataset_beta_thresh import (
-    MVTecTrainDataset,MVTecTestDataset,
     CustomTestDataset,CustomTrainDataset
 )
 from math import exp
@@ -312,11 +311,6 @@ def main():
         torch.cuda.manual_seed_all(manual_seed)
     print(f"Set seed to {manual_seed}")
 
-
-    mvtec_classes = args.get('mvtec_classes', ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper'])
-    visa_classes = args.get('visa_classes', ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum', 'macaroni1', 'macaroni2', 'pcb1', 'pcb2', 'pcb3', 'pcb4', 'pipe_fryum'])
-    mpdd_classes = args.get('mpdd_classes', ['bracket_black', 'bracket_brown', 'bracket_white', 'connector', 'metal_plate', 'tubes'])
-    dagm_classes = args.get('dagm_classes', [f'Class{i}' for i in range(1, 11)])
     custom_dataset_classes = args.get('custom_dataset_classes', ['chamber'])
 
     current_classes_to_run = custom_dataset_classes
@@ -327,12 +321,7 @@ def main():
 
         class_type_str = "Unknown"
         
-        if sub_class_name in mvtec_classes and "mvtec_root_path" in args:
-            dataset_root_path = os.path.join(args["mvtec_root_path"], sub_class_name)
-            TrainDS = MVTecTrainDataset
-            TestDS = MVTecTestDataset
-            class_type_str = 'MVTec'
-        elif sub_class_name in custom_dataset_classes and "custom_dataset_root_path" in args:
+        if sub_class_name in custom_dataset_classes and "custom_dataset_root_path" in args:
             dataset_root_path = os.path.join(args["custom_dataset_root_path"], sub_class_name)
             TrainDS = CustomTrainDataset
             TestDS = CustomTestDataset
