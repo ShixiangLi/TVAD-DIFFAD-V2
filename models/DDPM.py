@@ -147,11 +147,6 @@ class GaussianDiffusionModel:
         self.posterior_log_variance_clipped = np.log(
                 np.maximum(self.posterior_variance, 1e-20) # Clip small values before log
                 ) 
-        # Original code appended self.posterior_variance[1] for the first element.
-        # A common practice is to use the beta_0 for the first step if defined, or handle t=0 carefully.
-        # For consistency with OpenAI's guide-diffusion, they often use:
-        # self.posterior_log_variance_clipped = np.log(np.append(self.posterior_variance[1], self.posterior_variance[1:]))
-        # Let's stick to the direct log of potentially clipped posterior_variance for now.
 
 
         self.posterior_mean_coef1 = (
@@ -174,23 +169,6 @@ class GaussianDiffusionModel:
         
         indices_np = np.random.choice(len(p), size=b_size, p=p)
         indices = torch.from_numpy(indices_np).long().to(device)
-        
-        # weights_np = 1 / len(p) * p[indices_np] # This is not importance sampling weight, but probability
-        # Importance sampling weights for loss re-weighting (if needed) would be 1 / (N * p_i)
-        # For now, the 'weights' attribute seems to control the sampling distribution of t, not loss re-weighting directly here.
-        # If loss re-weighting by 1/p(t) is intended, it should be applied in the loss calculation.
-        # The original code returns 'weights' that look like 1 / (N * p_t) but N is len(p) here.
-        # Let's return the sampled timesteps. If loss re-weighting is needed, it's usually handled outside or with a different mechanism.
-        # For now, returning just indices. If `weights_for_loss` is needed, it should be 1.0 / (self.num_timesteps * p[indices_np])
-        
-        # Returning timesteps and placeholder weights if the original structure expected it
-        # However, these returned 'weights' are not standard importance weights for loss.
-        # Let's assume for now weights are for sampling distribution of t, and loss weighting is separate.
-        # If the original 'weights' return was meant for loss weighting by 1/p(t):
-        # effective_probs = p[indices_np]
-        # importance_weights = 1.0 / (self.num_timesteps * effective_probs) # Assuming N = self.num_timesteps
-        # importance_weights_tensor = torch.from_numpy(importance_weights).float().to(device)
-        # return indices, importance_weights_tensor
         
         # Sticking to simpler return of indices, assuming loss weighting is handled if 'prop-t' or 'uniform' selected for actual loss value.
         return indices, torch.ones_like(indices, dtype=torch.float32) # Placeholder weights, not used in current loss calculation
@@ -238,12 +216,6 @@ class GaussianDiffusionModel:
         if estimate_noise is None: # Pass current_features to model
             estimate_noise = model(x_t, t, current_features)
 
-
-        # Model variance can be fixed or learned. Here it's fixed.
-        # Commonly, model_var is either self.betas or self.posterior_variance
-        # The original code uses: np.append(self.posterior_variance[1], self.betas[1:]) which is a bit unusual.
-        # Let's use self.posterior_variance as it's related to q(x_{t-1}|x_t, x_0) or simply self.betas.
-        # Using self.betas for model_var_values (fixed variance to \beta_t)
         model_var_values = self.betas
         model_log_var_values = np.log(np.maximum(model_var_values, 1e-20)) # Clip for log
 
@@ -289,9 +261,6 @@ class GaussianDiffusionModel:
 
         if t_distance is None:
             t_distance = self.num_timesteps # Default to full num_timesteps
-        
-        # Ensure current_features are correctly shaped for batch if x is a batch
-        # Assuming current_features is already batched [B, 3] matching x [B, C, H, W]
 
         img_seq = [x.cpu().detach()] # Store sequence of images
 
@@ -393,24 +362,12 @@ class GaussianDiffusionModel:
         # Sample timesteps
         normal_t = torch.randint(0, args["less_t_range"], (batch_size,), device=x_0.device)
         noisier_t = torch.randint(args["less_t_range"], self.num_timesteps, (batch_size,), device=x_0.device)
-        
-        # Calculate losses and get intermediate states
-        # Assuming current_features are the same for both normal_t and noisier_t steps for a given x_0
+
         normal_loss_dict, x_normal_t, estimate_noise_normal = self.calc_loss(model, x_0, normal_t, current_features)
         noisier_loss_dict, x_noiser_t, estimate_noise_noisier = self.calc_loss(model, x_0, noisier_t, current_features)
         
         pred_x_0_noisier = self.predict_x_0_from_eps(x_noiser_t, noisier_t, estimate_noise_noisier).clamp(-1, 1)
-        # To sample x_t from a predicted x_0, we need noise. 
-        # The original used estimate_noise_normal. This implies using the *model's prediction* of noise at normal_t as if it were true noise.
-        # This is a specific choice for constructing pred_x_t_noisier.
-        # Let's assume the intention is to use a fresh random noise if estimate_noise_normal is not directly suitable as a "true" noise sample here.
-        # However, sticking to original logic:
-        noise_for_pred_x_t_noisier = estimate_noise_normal # This is unusual, typically you'd use fresh noise.
-                                                          # If this is model's *output* (predicted noise), using it as *input* noise needs care.
-                                                          # Let's assume it's a shorthand for some desired conditioning.
-                                                          # A safer bet, if standard diffusion sampling is intended from pred_x_0_noisier to normal_t:
-                                                          # fresh_noise_at_normal_t = self.noise_fn(pred_x_0_noisier, normal_t).float()
-                                                          # pred_x_t_noisier = self.sample_q(pred_x_0_noisier, normal_t, fresh_noise_at_normal_t)
+        noise_for_pred_x_t_noisier = estimate_noise_normal
 
         # Sticking to the paper's apparent structure if `estimate_noise_normal` is used as noise input for `sample_q`
         pred_x_t_noisier = self.sample_q(pred_x_0_noisier, normal_t, noise_for_pred_x_t_noisier)
@@ -418,10 +375,7 @@ class GaussianDiffusionModel:
         # Only calculate the noise loss of normal samples according to formula 9.
         # The loss is a sum of losses from two different t scales.
         combined_loss = normal_loss_dict["loss"] + noisier_loss_dict["loss"]
-        
-        # Filter for normal samples (anomaly_label == 0)
-        # Ensure anomaly_label is correctly shaped for broadcasting if needed, or use boolean indexing.
-        # anomaly_label should be [batch_size]
+
         if anomaly_label.ndim > 1: # E.g. [batch_size, 1]
             anomaly_label_flat = anomaly_label.squeeze()
         else:
@@ -432,10 +386,6 @@ class GaussianDiffusionModel:
         if torch.isnan(loss): # If batch contained only anomalies, mean results in NaN
             loss = torch.tensor(0.0, device=x_0.device, requires_grad=True) # Ensure it's a tensor that requires grad if it's part of loss computation
 
-        # Guidance term (Formula 10 in DiffAD paper implies estimate_noise_hat is for epsilon_theta_hat)
-        # The term (pred_x_t_noisier - x_normal_t) is the difference guiding the noise prediction.
-        # This difference is scaled by sqrt(1 - alpha_bar_t) and condition_w.
-        # estimate_noise_hat = predicted_noise_at_normal_t - guidance_term
         guidance_scale = extract(self.sqrt_one_minus_alphas_cumprod, normal_t, x_normal_t.shape, x_0.device) * args["condition_w"]
         guidance_term = guidance_scale * (pred_x_t_noisier - x_normal_t)
         
