@@ -3,7 +3,7 @@
   "channels": 3,
   "Batch_Size": 64,
   "eval_batch_size": 64,
-  "EPOCHS": 70,
+  "EPOCHS": 50,
   "T": 1000,
   "seed": 42,
 
@@ -45,15 +45,6 @@
   "dataset_type_to_run": "Custom",
   "custom_dataset_root_path": "datasets/combustion_dataset",
   "custom_dataset_classes": ["chamber"],
-
-  "mvtec_root_path": "datasets/mvtec_anomaly_detection",
-  "mvtec_classes": ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut", "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"],
-  "visa_root_path": "datasets/VisA",
-  "visa_classes": ["candle", "capsules", "cashew", "chewinggum", "fryum", "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum"],
-  "mpdd_root_path": "datasets/MPDD",
-  "mpdd_classes": ["bracket_black", "bracket_brown", "bracket_white", "connector", "metal_plate", "tubes"],
-  "dagm_root_path": "datasets/DAGM",
-  "dagm_classes": ["Class1", "Class2", "Class3", "Class4", "Class5", "Class6", "Class7", "Class8", "Class9", "Class10"],
 
   "anomaly_source_path": "datasets/DTD",
 

@@ -73,8 +73,8 @@ print(f"分类完成：找到 {len(normal_indices)} 个正常样本和 {len(abno
 
 # --- 6. 分配训练集与测试集 ---
 # 随机打乱索引列表以确保抽样是随机的
-random.shuffle(normal_indices)
-random.shuffle(abnormal_indices)
+# random.shuffle(normal_indices)
+# random.shuffle(abnormal_indices)
 
 # 验证样本数量是否足够
 if len(normal_indices) < X_NORMAL_TEST_SAMPLES:
