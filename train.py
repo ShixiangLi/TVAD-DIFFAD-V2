@@ -148,13 +148,12 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
 
             current_combined_auroc = temp_image_auroc + temp_pixel_auroc
             if current_combined_auroc >= best_combined_auroc:
-                if temp_image_auroc >= best_image_auroc :
-                    best_combined_auroc = current_combined_auroc
-                    best_image_auroc = temp_image_auroc
-                    best_pixel_auroc = temp_pixel_auroc
-                    best_epoch = epoch + 1
-                    save(unet_model, seg_model, optimizer_ddpm, optimizer_seg, scheduler_seg, args=args, final='best', epoch=epoch + 1, sub_class=sub_class)
-                    print(f"*** New best model saved at epoch {best_epoch} with Image AUROC: {best_image_auroc:.2f}, Pixel AUROC: {best_pixel_auroc:.2f} ***")
+                best_combined_auroc = current_combined_auroc
+                best_image_auroc = temp_image_auroc
+                best_pixel_auroc = temp_pixel_auroc
+                best_epoch = epoch + 1
+                save(unet_model, seg_model, optimizer_ddpm, optimizer_seg, scheduler_seg, args=args, final='best', epoch=epoch + 1, sub_class=sub_class)
+                print(f"*** New best model saved at epoch {best_epoch} with Image AUROC: {best_image_auroc:.2f}, Pixel AUROC: {best_pixel_auroc:.2f} ***")
 
         if (epoch + 1) % args.get("log_loss_every_epochs", 5) == 0:
             train_loss_list.append(round(avg_epoch_train_loss, 4))

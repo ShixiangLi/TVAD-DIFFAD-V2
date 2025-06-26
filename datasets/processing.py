@@ -7,8 +7,8 @@ import shutil
 
 # --- 1. 配置参数 ---
 # 您可以在这里设置测试集中需要的样本数量
-X_NORMAL_TEST_SAMPLES = 2000  # 测试集中需要的【正常】样本数量
-Y_ABNORMAL_TEST_SAMPLES = 2000 # 测试集中需要的【异常】样本数量
+X_NORMAL_TEST_SAMPLES = 5000  # 测试集中需要的【正常】样本数量
+Y_ABNORMAL_TEST_SAMPLES = 5000 # 测试集中需要的【异常】样本数量
 
 # --- 2. 定义路径 ---
 # 原始数据输入路径
