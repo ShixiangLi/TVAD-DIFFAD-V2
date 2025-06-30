@@ -53,6 +53,9 @@ except FileNotFoundError as e:
     exit()
 print("数据加载成功。")
 
+mean = current_data.mean(axis=(0, 1), keepdims=True)
+std = current_data.std(axis=(0, 1), keepdims=True)
+current_data = (current_data - mean) / (std + 1e-8)
 
 # --- 5. 分类：区分正常与异常样本 ---
 print("正在分类所有样本 (正常/异常)...")

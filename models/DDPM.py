@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision.transforms as T
+import torch.nn.functional as F
 
 def get_beta_schedule(num_diffusion_steps, name="cosine"):
     betas = []
@@ -396,7 +397,7 @@ class GaussianDiffusionModel:
         return loss, pred_x_0_norm_guided, normal_t, x_normal_t, x_noiser_t # Returning scalar loss
 
 
-    def norm_guided_one_step_denoising_eval(self, model, x_0, normal_t, noisier_t, args, current_features): # Added current_features
+    def norm_guided_one_step_denoising_eval(self, model, aligner, loss_fn, x_0, normal_t, noisier_t, args, current_features): # Added current_features
         # normal_t and noisier_t are tensors here, already batched.
         batch_size = x_0.shape[0]
 
@@ -422,7 +423,16 @@ class GaussianDiffusionModel:
         estimate_noise_hat = estimate_noise_normal - guidance_term
         
         pred_x_0_norm_guided = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
-        
+        with torch.enable_grad():
+            z_0 = pred_x_0_norm_guided.clone().detach().requires_grad_(True)
+
+            for i in range(50):
+                z, c = aligner(z_0, current_features)
+                loss = loss_fn(z, c)
+                grad = torch.autograd.grad(loss, z_0)[0]
+                
+                z_0 = (z_0.detach() - grad).requires_grad_(True)
+        pred_x_0_norm_guided = z_0.detach()
         return loss, pred_x_0_norm_guided, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier  
     
 

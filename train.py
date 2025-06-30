@@ -19,6 +19,8 @@ from models.DDPM import GaussianDiffusionModel, get_beta_schedule
 from sklearn.metrics import roc_auc_score
 import pandas as pd
 from collections import defaultdict
+from models.aligner import ImageEncoder, CurrentEncoder, Aligner
+from train_aligner import HardNegativeContrastiveLoss
 
 def weights_init(m):
         classname = m.__class__.__name__
@@ -56,7 +58,7 @@ class BinaryFocalLoss(nn.Module):
             return F_loss
 
 def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_class, class_type, device, 
-          unet_model, seg_model, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch=0):
+          unet_model, seg_model, aligner, loss_fn, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch=0):
    
     in_channels = args["channels"]
     betas = get_beta_schedule(args['T'], args['beta_schedule'])
@@ -83,7 +85,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
     
     if start_epoch > 0:
         print(f"Evaluating loaded model from epoch {start_epoch} before continuing training...")
-        best_image_auroc, best_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, data_len, sub_class, device)
+        best_image_auroc, best_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, data_len, sub_class, device)
         best_combined_auroc = best_image_auroc + best_pixel_auroc
         print(f"Loaded model performance - Image AUROC: {best_image_auroc:.2f}, Pixel AUROC: {best_pixel_auroc:.2f}")
 
@@ -144,7 +146,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
         scheduler_seg.step()
 
         if (epoch + 1) % args.get("eval_every_epochs", 10) == 0:
-            temp_image_auroc, temp_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, data_len, sub_class, device)
+            temp_image_auroc, temp_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, data_len, sub_class, device)
 
             current_combined_auroc = temp_image_auroc + temp_pixel_auroc
             if current_combined_auroc >= best_combined_auroc:
@@ -173,7 +175,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
     print(f"Training summary saved to {csv_filename}")
 
 
-def eval(testing_dataset_loader, args, unet_model, seg_model, data_len, sub_class, device):
+def eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, data_len, sub_class, device):
     unet_model.eval()
     seg_model.eval()
     
@@ -209,7 +211,7 @@ def eval(testing_dataset_loader, args, unet_model, seg_model, data_len, sub_clas
             noisier_t_tensor = torch.tensor([args["eval_noisier_t"]], device=image.device).repeat(image.shape[0])
             
             _, pred_x_0_condition, _, _, _, _, _ = ddpm_sample.norm_guided_one_step_denoising_eval(
-                unet_model, image, normal_t_tensor, noisier_t_tensor, args, current_features
+                unet_model, aligner, loss_fn, image, normal_t_tensor, noisier_t_tensor, args, current_features
             )
             
             seg_input_eval = torch.cat((image, pred_x_0_condition), dim=1)
@@ -371,6 +373,14 @@ def main():
             in_channels=in_channels * 2, out_channels=1
         ).to(device)
         
+        aligner_model = Aligner(
+            ImageEncoder(latent_dim=args['aligner']['latent_dim']),
+            CurrentEncoder(latent_dim=args['aligner']['latent_dim'])
+        ).to(device)
+        aligner_model.load_state_dict(torch.load(args['aligner']['model_path'], map_location=device))
+        aligner_model.eval()
+        loss_fn = HardNegativeContrastiveLoss(temperature=args['aligner']['temperature'], top_k=args['aligner']['hard_negative_top_k']).to(device)
+
         optimizer_ddpm = optim.Adam(unet_model.parameters(), lr=args['diffusion_lr'], weight_decay=args['weight_decay'])
         optimizer_seg = optim.Adam(seg_model.parameters(), lr=args['seg_lr'], weight_decay=args['weight_decay'])
 
@@ -404,7 +414,7 @@ def main():
             print(f"未找到已保存的模型。将从 Epoch 1 开始全新训练。")
 
         train(training_loader, testing_loader, args, test_data_len, sub_class_name, class_type_str, device,
-              unet_model, seg_model, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch)
+              unet_model, seg_model, aligner_model, loss_fn, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch)
 
     print("\n--- All training sessions complete. ---")
 

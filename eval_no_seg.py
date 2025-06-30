@@ -1,13 +1,13 @@
 import matplotlib.pyplot as plt
 import torch
 from sklearn.metrics import auc, roc_curve, average_precision_score, roc_auc_score
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix 
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix # New imports
+# import time # Unused
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import cv2
 from models.Recon_subnetwork import UNetModel
-from models.Seg_subnetwork import SegmentationSubNetwork
-# import torch.nn as nn # Duplicated
+# from models.Seg_subnetwork import SegmentationSubNetwork
 from data.dataset_beta_thresh import (
     CustomTestDataset
 )
@@ -34,6 +34,9 @@ def min_max_norm(image): # Renamed from local min_max_norm in pixel_pro for broa
     return (image - a_min) / (a_max - a_min)
 
 def pixel_pro(gt_mask_list, pred_score_map_list): # Takes lists of masks and score maps
+    # Convert inputs to numpy arrays if they are not already
+    # Expects gt_mask_list to be list of [H, W] binary masks (0 or 255/1)
+    # Expects pred_score_map_list to be list of [H, W] float score maps (0-1)
     
     if not isinstance(gt_mask_list, np.ndarray):
         gt_masks_np = np.array(gt_mask_list)
@@ -55,7 +58,7 @@ def pixel_pro(gt_mask_list, pred_score_map_list): # Takes lists of masks and sco
     max_th = pred_score_maps_np.max()
     min_th = pred_score_maps_np.min()
 
-    if max_th == min_th: 
+    if max_th == min_th: # Handle case where all prediction scores are the same
         print("Warning: All prediction scores are identical in pixel_pro. AUPRO might be 0.")
         return 0.0 
 
@@ -92,15 +95,17 @@ def pixel_pro(gt_mask_list, pred_score_map_list): # Takes lists of masks and sco
                 pro = intersection / prop.area # prop.area is the size of the GT region
                 current_step_pros.append(pro)
         
+        # Calculate FPR for the current threshold across all images
         gt_masks_neg = ~gt_masks_bool # Negative (normal) pixels in GT
         fp = np.logical_and(gt_masks_neg, binary_score_maps).sum()
+
         if gt_masks_neg.sum() == 0: 
             fpr = 1.0 if fp > 0 else 0.0 # If all GT is anomaly, any FP prediction means FPR is effectively 1
         else:
             fpr = fp / gt_masks_neg.sum()
 
         if fpr <= expect_fpr:
-            if current_step_pros: # Only add if there were actual anomaly regions to calculate PRO for
+            if current_step_pros:
                 pros_mean_at_fpr_lt_0_3.append(np.mean(current_step_pros))
             else:
                 pros_mean_at_fpr_lt_0_3.append(0.0) 
@@ -114,10 +119,11 @@ def pixel_pro(gt_mask_list, pred_score_map_list): # Takes lists of masks and sco
     fprs_selected_sorted = np.array(fprs_for_pro_auc)[sorted_indices]
     pros_mean_selected_sorted = np.array(pros_mean_at_fpr_lt_0_3)[sorted_indices]
 
-    if fprs_selected_sorted.max() == fprs_selected_sorted.min():
+    if fprs_selected_sorted.max() == fprs_selected_sorted.min(): 
         return 0.0
 
     fprs_normalized_for_auc = fprs_selected_sorted / expect_fpr
+    # Ensure it's clipped to [0,1] after division, in case some fprs were slightly > expect_fpr due to float precision
     fprs_normalized_for_auc = np.clip(fprs_normalized_for_auc, 0, 1)
 
     unique_fprs, unique_indices = np.unique(fprs_normalized_for_auc, return_index=True)
@@ -125,6 +131,7 @@ def pixel_pro(gt_mask_list, pred_score_map_list): # Takes lists of masks and sco
 
     if len(unique_fprs) < 2: # Need at least two points for AUC
         return 0.0
+
     seg_pro_auc = auc(unique_fprs, unique_pros)
     return seg_pro_auc
 
@@ -194,8 +201,9 @@ def load_parameters_and_checkpoint(device, sub_class_name, checkpoint_type, args
     checkpoint_data = load_checkpoint(args_config, device, sub_class_name, checkpoint_type)
  
     return args_config, checkpoint_data
-def image_transform_back_to_255(image_tensor_chw): # Expects (C,H,W) tensor normalized -1 to 1 or 0 to 1
 
+def image_transform_back_to_255(image_tensor_chw): # Expects (C,H,W) tensor normalized -1 to 1 or 0 to 1
+    # If input is [-1, 1], first map to [0, 1]
     if image_tensor_chw.min() < -0.001: # Heuristic for [-1, 1] range
         img_0_1 = (image_tensor_chw + 1.0) / 2.0
     else: # Assumed to be [0, 1]
@@ -217,7 +225,7 @@ def show_cam_on_image(rgb_img_0_255, anomaly_map_0_1_normalized, weight=0.6): # 
 
 def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, out_mask_chw_01,
                         pred_x_0_condition_chw_01, args_config, sub_class_name, checkpoint_type, image_score_val,
-                        optimal_pixel_threshold,
+                        pixel_threshold_for_viz,
                         x_normal_t_chw_01=None, x_noiser_t_chw_01=None, pred_x_t_noisier_chw_01=None,
                         pred_x_0_normal_chw_01=None, pred_x_0_noisier_chw_01=None):
 
@@ -231,6 +239,7 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     )
     os.makedirs(viz_path_specific, exist_ok=True)
 
+    # --- Prepare all display images (convert CHW to HWC, scale to 0-255 uint8) ---
     def prep_display_img(img_data_chw, is_mask=False): # Added is_mask for specific handling if needed
         if img_data_chw is None:
             ph_size = args_config.get("img_size", [64, 64])
@@ -252,6 +261,7 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
 
     if out_mask_chw_01 is not None:
         anomaly_map_raw_hw = out_mask_chw_01[0] # This is the raw score map (H,W)
+        
         anomaly_map_smoothed_hw = gaussian_filter(anomaly_map_raw_hw, sigma=args_config.get("viz_gaussian_sigma", 4))
         anomaly_map_normalized_hw = min_max_norm(anomaly_map_smoothed_hw)
         
@@ -260,7 +270,8 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
             raw_for_blend_hwc = cv2.cvtColor(raw_for_blend_hwc, cv2.COLOR_GRAY2RGB)
         heatmap_on_image_disp_hwc = show_cam_on_image(raw_for_blend_hwc, anomaly_map_normalized_hw)
 
-        binary_prediction_mask_hw = (anomaly_map_raw_hw >= optimal_pixel_threshold).astype(np.uint8) * 255
+        # Apply threshold to the raw anomaly map to get the binary prediction
+        binary_prediction_mask_hw = (anomaly_map_raw_hw >= pixel_threshold_for_viz).astype(np.uint8) * 255
         out_mask_disp_hw = binary_prediction_mask_hw # This is the key change
 
     else:
@@ -284,13 +295,14 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     ]
     plot_cmaps_row1 = [None, "gray", None, None, None]
 
-    plot_titles_row2 = ["Heatmap Overlay", "Predicted Mask (Binary)", "recon_normal", "recon_noisier", "recon_con"]
+    plot_titles_row2 = ["Heatmap Overlay", f"Predicted Mask (Thresh={pixel_threshold_for_viz:.4f})", "recon_normal", "recon_noisier", "recon_con"]
     plot_data_row2 = [
         heatmap_on_image_disp_hwc, out_mask_disp_hw, recon_normal_disp_hwc,
         recon_noisier_disp_hwc, recon_con_disp_hwc
     ]
     plot_cmaps_row2 = [None, "gray", None, None, None]
 
+    # --- Modified fig creation and layout ---
     fig, axes = plt.subplots(2, 5, figsize=(15, 7.2), constrained_layout=True)
     fig.suptitle(f'Class: {sub_class_name} - Img: {os.path.basename(image_path_str)} - Score: {image_score_val:.4f}', fontsize=10)
 
@@ -315,7 +327,8 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     plt.savefig(savename_full)
     plt.close(fig)
 
-def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_model, loss_fn, sub_class_name, class_type_str, checkpoint_type, device):
+def testing(testing_dataset_loader, args_config, unet_model, aligner_model, loss_fn, sub_class_name, class_type_str, checkpoint_type, device):
+    # args_config is the loaded configuration dictionary
     
     normal_t_eval = args_config["eval_normal_t"]
     noisier_t_eval = args_config["eval_noisier_t"]
@@ -339,7 +352,6 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
     viz_data_list = [] # List to store data for visualization
     
     unet_model.eval()
-    seg_model.eval()
     
     with torch.no_grad():
         tbar_test = tqdm(testing_dataset_loader, desc=f"Testing {sub_class_name}", leave=False)
@@ -350,15 +362,12 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
             image_path_info = sample.get("file_name", f"unknown_image_{i}") # Get filepath for saving viz
             if isinstance(image_path_info, list): image_path_info = image_path_info[0]
 
-
-            # --- Current Features (for testing) ---
             if 'current_features' in sample and sample['current_features'] is not None:
                  current_features = sample['current_features'].to(device)
             else:
                  # MODIFIED: Update placeholder shape
                  print("Warning: 'current_features' not found in test sample. Using dummy tensor.")
                  current_features = torch.randn(image_tensor.shape[0], 24, 3, device=device) 
-            # --- End Current Features ---
 
             # Prepare timesteps for evaluation
             batch_size_current = image_tensor.shape[0]
@@ -371,12 +380,9 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
                 unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch, args_config, current_features
             )
             
-            # Segmentation model inference
-            seg_input_tensor = torch.cat((image_tensor, pred_x_0_cond), dim=1)
-            pred_anomaly_map = seg_model(seg_input_tensor) # (B, 1, H, W)
 
-            # --- Metric Calculation ---
-            # Image-level score (e.g., mean of top-k pixels in anomaly map)
+            pred_anomaly_map = torch.mean(torch.abs(image_tensor - pred_x_0_cond), dim=1, keepdim=True)
+
             flat_pred_map = pred_anomaly_map.view(batch_size_current, -1)
             k_top = args_config.get("image_score_top_k", 50)
             if flat_pred_map.shape[1] >= k_top:
@@ -393,7 +399,6 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
                 all_pixel_gts_list.append(pixel_mask_gt[b_idx, 0].cpu().numpy()) # (H, W)
                 all_pixel_preds_list.append(pred_anomaly_map[b_idx, 0].cpu().numpy()) # (H, W)
 
-            # --- Store data for visualization (postponed until after threshold calculation) ---
             if args_config.get("save_visualizations_eval", True) and i < args_config.get("num_viz_to_save", 5):
                 # We only need to store the data for the first image in the batch for visualization
                 viz_data = {
@@ -480,11 +485,8 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
             print(f"Pixel AUROC for {sub_class_name}: {auroc_pixel:.2f}%")
             print(f"Pixel AP for {sub_class_name}: {ap_pixel:.2f}%")
 
-            # --- Find and print OPTIMAL PIXEL THRESHOLD for metrics AND visualization ---
-            fpr_px, tpr_px, thresholds_px = roc_curve(flat_pixel_gts_np, flat_pixel_preds_np)
-            optimal_idx_px = np.argmax(tpr_px - fpr_px) # Youden's J statistic
-            optimal_threshold_px = thresholds_px[optimal_idx_px]
-            print(f"Optimal Pixel Threshold for mIoU/Acc/F1 (and Visualizations): {optimal_threshold_px:.4f}")
+            optimal_threshold_px = np.percentile(flat_pixel_preds_np, 99)
+            print(f"Using 99th Percentile Pixel Threshold for mIoU/Acc/F1 (and Visualizations): {optimal_threshold_px:.4f}")
 
             binary_pixel_preds_np = (flat_pixel_preds_np >= optimal_threshold_px).astype(int)
 
@@ -519,7 +521,7 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
         print("Pixel metrics skipped: No pixel ground truth or predictions available.")
 
     if args_config.get("save_visualizations_eval", True) and viz_data_list:
-        print(f"Generating visualizations with optimal pixel threshold: {optimal_threshold_px:.4f}...")
+        print(f"Generating visualizations with 99th percentile pixel threshold: {optimal_threshold_px:.4f}...")
         for data in tqdm(viz_data_list, desc="Saving visualizations"):
             save_visualizations(
                 image_path_str=data["image_path_info"],
@@ -531,7 +533,8 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
                 sub_class_name=sub_class_name,
                 checkpoint_type=checkpoint_type,
                 image_score_val=data["image_score_val"],
-                optimal_pixel_threshold=optimal_threshold_px, # Pass the calculated threshold
+                # MODIFIED: Pass the calculated 99th percentile threshold
+                pixel_threshold_for_viz=optimal_threshold_px,
                 x_normal_t_chw_01=data["x_normal_t_chw_01"],
                 x_noiser_t_chw_01=data["x_noiser_t_chw_01"],
                 pred_x_t_noisier_chw_01=data["pred_x_t_noisier_chw_01"],
@@ -588,6 +591,7 @@ def main():
 
     for sub_class_item in classes_to_evaluate:
         print(f"\n--- Evaluating Class: {sub_class_item} ---")
+
         args_config, checkpoint_data = load_parameters_and_checkpoint(device, sub_class_item, checkpoint_type_to_load, args_filename_to_use)
 
         if args_config is None or checkpoint_data is None:
@@ -611,12 +615,6 @@ def main():
             in_channels=in_channels_model
         ).to(device)
 
-        # Initialize Segmentation model
-        seg_model_eval = SegmentationSubNetwork(
-            in_channels=in_channels_model * 2, # Expects concatenated original and reconstructed
-            out_channels=1 # Outputs a single-channel anomaly map
-        ).to(device)
-        
         aligner_model = Aligner(
             ImageEncoder(latent_dim=args_config['aligner']['latent_dim']),
             CurrentEncoder(latent_dim=args_config['aligner']['latent_dim'])
@@ -628,16 +626,14 @@ def main():
         # Load state dicts from checkpoint
         try:
             unet_model_eval.load_state_dict(checkpoint_data["unet_model_state_dict"])
-            seg_model_eval.load_state_dict(checkpoint_data["seg_model_state_dict"])
         except KeyError as e:
-            print(f"Error: Missing key in checkpoint_data for {sub_class_item}: {e}. Ensure checkpoint is valid.")
+            print(f"Error: Missing key in checkpoint_data for {sub_class_item}: {e}. Ensure checkpoint contains 'unet_model_state_dict'.")
             continue
         except Exception as e:
             print(f"Error loading model state_dict for {sub_class_item}: {e}")
             continue
             
         unet_model_eval.eval() # Set to evaluation mode
-        seg_model_eval.eval()
 
         # Determine dataset type and path
         dataset_root_main = "" # Base path for the dataset type (e.g., MVTec root, VisA root)
@@ -676,7 +672,7 @@ def main():
         eval_output_base = os.path.join(args_config["output_path"], "metrics", f"ARGS={args_config['arg_num']}", sub_class_item)
         os.makedirs(eval_output_base, exist_ok=True)
 
-        testing(test_loader_current, args_config, unet_model_eval, seg_model_eval, aligner_model, loss_fn, 
+        testing(test_loader_current, args_config, unet_model_eval, aligner_model, loss_fn, 
                 sub_class_item, class_type_name, checkpoint_type_to_load, device)
 
     print("\n--- All evaluations complete. ---")
