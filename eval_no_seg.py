@@ -26,6 +26,13 @@ from skimage.measure import label, regionprops
 from models.aligner import ImageEncoder, CurrentEncoder, Aligner
 from train_aligner import HardNegativeContrastiveLoss
 
+# 导入掩码生成器
+try:
+    from models.mask_generator import DynamicMaskGenerator
+except ImportError:
+    print("警告: 无法导入DynamicMaskGenerator，将禁用Masked Diffusion")
+    DynamicMaskGenerator = None
+
 # Helper for pixel_pro AUC calculation (from original)
 def min_max_norm(image): # Renamed from local min_max_norm in pixel_pro for broader use if needed
     a_min, a_max = image.min(), image.max()
@@ -333,6 +340,25 @@ def testing(testing_dataset_loader, args_config, unet_model, aligner_model, loss
     normal_t_eval = args_config["eval_normal_t"]
     noisier_t_eval = args_config["eval_noisier_t"]
     
+    # 初始化掩码扩散相关参数
+    use_masked_diffusion = args_config.get('use_masked_diffusion', False)
+    mask_threshold = args_config.get('mask_threshold', 0.1)
+    mask_blur_radius = args_config.get('mask_blur_radius', 5.0)
+    mask_smooth_radius = args_config.get('mask_smooth_radius', 5.0)
+    
+    # 如果启用掩码扩散，初始化掩码生成器
+    mask_generator = None
+    if use_masked_diffusion and DynamicMaskGenerator is not None:
+        try:
+            mask_generator = DynamicMaskGenerator(
+                threshold=mask_threshold,
+                blur_radius=mask_blur_radius
+            ).to(device)
+            print(f"使用Masked Diffusion进行评估 (阈值={mask_threshold}, 模糊半径={mask_blur_radius})")
+        except Exception as e:
+            print(f"警告: 初始化掩码生成器失败: {e}，将禁用Masked Diffusion")
+            use_masked_diffusion = False
+    
     # Setup DDPM sampler
     in_channels_ddpm = args_config["channels"]
     betas_ddpm = get_beta_schedule(args_config['T'], args_config['beta_schedule'])
@@ -374,13 +400,33 @@ def testing(testing_dataset_loader, args_config, unet_model, aligner_model, loss
             normal_t_batch = torch.tensor([normal_t_eval], device=device).repeat(batch_size_current)
             noisier_t_batch = torch.tensor([noisier_t_eval], device=device).repeat(batch_size_current)
             
-            # DDPM inference to get reconstructed image
-            eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, \
-            x_norm_t, x_nois_t, pred_x_t_nois = ddpm_sampler.norm_guided_one_step_denoising_eval(
-                unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch, args_config, current_features
-            )
+            # 如果使用掩码扩散，执行两次重建
+            if use_masked_diffusion and mask_generator is not None:
+                # 第一次重建以生成掩码
+                _, initial_recon, _, _, _, _, _ = ddpm_sampler.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner_model, loss_fn, image_tensor, 
+                    normal_t_batch, noisier_t_batch, args_config, current_features
+                )
+                
+                # 生成掩码
+                anomaly_mask = mask_generator(image_tensor, initial_recon)
+                
+                # 第二次带掩码引导的重建
+                eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, \
+                x_norm_t, x_nois_t, pred_x_t_nois = ddpm_sampler.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch, 
+                    args_config, current_features, mask=anomaly_mask,
+                    mask_smooth_radius=mask_smooth_radius, use_mask=True
+                )
+            else:
+                # 标准单次重建
+                eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, \
+                x_norm_t, x_nois_t, pred_x_t_nois = ddpm_sampler.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch, 
+                    args_config, current_features
+                )
             
-
+            # 计算异常图 - 保持原有逻辑不变
             pred_anomaly_map = torch.mean(torch.abs(image_tensor - pred_x_0_cond), dim=1, keepdim=True)
 
             flat_pred_map = pred_anomaly_map.view(batch_size_current, -1)
@@ -414,6 +460,11 @@ def testing(testing_dataset_loader, args_config, unet_model, aligner_model, loss
                     "pred_x_0_normal_chw_01": pred_x_0_norm[0].cpu().numpy() if pred_x_0_norm is not None else None,
                     "pred_x_0_noisier_chw_01": pred_x_0_nois[0].cpu().numpy() if pred_x_0_nois is not None else None,
                 }
+                # 添加掩码信息，但不改变可视化逻辑
+                if use_masked_diffusion and 'anomaly_mask' in locals():
+                    viz_data["anomaly_mask"] = anomaly_mask[0].cpu().numpy() if anomaly_mask is not None else None
+                    viz_data["initial_recon"] = initial_recon[0].cpu().numpy() if initial_recon is not None else None
+                    
                 viz_data_list.append(viz_data)
 
     # --- Calculate final metrics ---
@@ -584,7 +635,29 @@ def main():
     if args_config_session is None:
         print("Failed to load base arguments. Exiting.")
         return
-        
+    
+    # 检查是否有掩码扩散相关的参数，如果没有则添加默认值
+    mask_diffusion_params = {
+        'use_masked_diffusion': False,  # 默认不启用
+        'mask_threshold': 0.1,          # 掩码生成阈值
+        'mask_blur_radius': 5.0,        # 掩码模糊半径
+        'mask_smooth_radius': 5.0       # 掩码平滑半径
+    }
+    
+    for key, default_value in mask_diffusion_params.items():
+        if key not in args_config_session:
+            args_config_session[key] = default_value
+            print(f"注意: 未找到参数 '{key}'，使用默认值 {default_value}")
+    
+    # 检查是否在命令行指定了启用掩码扩散
+    if os.environ.get("USE_MASKED_DIFFUSION", "").lower() in ("true", "1", "yes"):
+        args_config_session['use_masked_diffusion'] = True
+        print("通过环境变量启用掩码扩散")
+    
+    print(f"掩码扩散设置: 启用={args_config_session['use_masked_diffusion']}, " +
+          f"阈值={args_config_session['mask_threshold']}, " + 
+          f"模糊半径={args_config_session['mask_blur_radius']}")
+    
     classes_to_evaluate = args_config_session.get('custom_dataset_classes', custom_dataset_classes_default)
     # --- End Configuration Loading ---
 

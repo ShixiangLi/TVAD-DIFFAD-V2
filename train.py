@@ -74,6 +74,21 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
     loss_focal = BinaryFocalLoss().to(device)
     loss_smL1= nn.SmoothL1Loss().to(device)
     
+    # 初始化掩码生成器（如果启用）
+    use_masked_diffusion = args.get('use_masked_diffusion', False)
+    mask_generator = None
+    if use_masked_diffusion:
+        try:
+            from models.mask_generator import DynamicMaskGenerator
+            mask_generator = DynamicMaskGenerator(
+                threshold=args.get('mask_threshold', 0.1),
+                blur_radius=args.get('mask_blur_radius', 5.0)
+            ).to(device)
+            print(f"训练中启用Masked Diffusion, 阈值={args.get('mask_threshold', 0.1)}, 模糊半径={args.get('mask_blur_radius', 5.0)}")
+        except ImportError:
+            print("警告: 无法导入DynamicMaskGenerator，将禁用Masked Diffusion")
+            use_masked_diffusion = False
+    
     tqdm_epoch = range(start_epoch, args['EPOCHS'])
     
     train_loss_list=[]
@@ -111,9 +126,28 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
                  print("Warning: 'current_features' not found in sample. Using dummy tensor.")
                  current_features = torch.randn(aug_image.shape[0], 24, 3, device=device) 
 
-            noise_loss_val, pred_x0, normal_t, x_normal_t, x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(
-                unet_model, aug_image, anomaly_label, args, current_features
-            )
+            # 如果使用掩码扩散，先进行一次标准去噪得到初始重建，再生成掩码
+            if use_masked_diffusion:
+                # 先进行标准去噪，获取初步重建结果（不影响梯度）
+                with torch.no_grad():
+                    _, initial_recon, _, _, _ = ddpm_sample.norm_guided_one_step_denoising(
+                        unet_model, aug_image, anomaly_label, args, current_features
+                    )
+                
+                # 生成掩码
+                diff_mask = mask_generator(aug_image, initial_recon)
+                
+                # 带掩码的引导去噪
+                noise_loss_val, pred_x0, normal_t, x_normal_t, x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(
+                    unet_model, aug_image, anomaly_label, args, current_features,
+                    mask=diff_mask, mask_smooth_radius=args.get('mask_smooth_radius', 5.0), 
+                    use_mask=True
+                )
+            else:
+                # 原有的标准去噪
+                noise_loss_val, pred_x0, normal_t, x_normal_t, x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(
+                    unet_model, aug_image, anomaly_label, args, current_features
+                )
             
             seg_input = torch.cat((aug_image, pred_x0), dim=1)
             pred_mask = seg_model(seg_input) 
@@ -179,6 +213,21 @@ def eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, 
     unet_model.eval()
     seg_model.eval()
     
+    # 初始化掩码生成器（如果启用）
+    use_masked_diffusion = args.get('use_masked_diffusion', False)
+    mask_generator = None
+    if use_masked_diffusion:
+        try:
+            from models.mask_generator import DynamicMaskGenerator
+            mask_generator = DynamicMaskGenerator(
+                threshold=args.get('mask_threshold', 0.1),
+                blur_radius=args.get('mask_blur_radius', 5.0)
+            ).to(device)
+            print(f"评估中启用Masked Diffusion, 阈值={args.get('mask_threshold', 0.1)}")
+        except ImportError:
+            print("警告: 无法导入DynamicMaskGenerator，将禁用Masked Diffusion")
+            use_masked_diffusion = False
+    
     in_channels = args["channels"]
     betas = get_beta_schedule(args['T'], args['beta_schedule'])
 
@@ -210,10 +259,29 @@ def eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, 
             normal_t_tensor = torch.tensor([args["eval_normal_t"]], device=image.device).repeat(image.shape[0])
             noisier_t_tensor = torch.tensor([args["eval_noisier_t"]], device=image.device).repeat(image.shape[0])
             
-            _, pred_x_0_condition, _, _, _, _, _ = ddpm_sample.norm_guided_one_step_denoising_eval(
-                unet_model, aligner, loss_fn, image, normal_t_tensor, noisier_t_tensor, args, current_features
-            )
-            
+            # 如果使用掩码扩散
+            if use_masked_diffusion:
+                # 第一次标准重建，用于生成掩码
+                _, initial_recon, _, _, _, _, _ = ddpm_sample.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner, loss_fn, image, normal_t_tensor, noisier_t_tensor, 
+                    args, current_features
+                )
+                
+                # 生成掩码
+                anomaly_mask = mask_generator(image, initial_recon)
+                
+                # 第二次带掩码引导的重建
+                _, pred_x_0_condition, _, _, _, _, _ = ddpm_sample.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner, loss_fn, image, normal_t_tensor, noisier_t_tensor, 
+                    args, current_features, mask=anomaly_mask,
+                    mask_smooth_radius=args.get('mask_smooth_radius', 5.0), use_mask=True
+                )
+            else:
+                # 原始的标准重建
+                _, pred_x_0_condition, _, _, _, _, _ = ddpm_sample.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner, loss_fn, image, normal_t_tensor, noisier_t_tensor, args, current_features
+                )
+                
             seg_input_eval = torch.cat((image, pred_x_0_condition), dim=1)
             pred_mask_seg = seg_model(seg_input_eval)
             out_mask = pred_mask_seg

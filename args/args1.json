@@ -56,6 +56,11 @@
   "save_imgs": true,
   "save_vids": false,
 
+  "use_masked_diffusion": true,
+  "mask_threshold": 0.1,
+  "mask_blur_radius": 5.0,
+  "mask_smooth_radius": 5.0,
+
   "aligner":{
     "img_size": [64, 64],
     "Batch_Size": 128,

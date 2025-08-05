@@ -217,7 +217,7 @@ def show_cam_on_image(rgb_img_0_255, anomaly_map_0_1_normalized, weight=0.6): # 
 
 def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, out_mask_chw_01,
                         pred_x_0_condition_chw_01, args_config, sub_class_name, checkpoint_type, image_score_val,
-                        optimal_pixel_threshold,
+                        pixel_threshold_for_viz,
                         x_normal_t_chw_01=None, x_noiser_t_chw_01=None, pred_x_t_noisier_chw_01=None,
                         pred_x_0_normal_chw_01=None, pred_x_0_noisier_chw_01=None):
 
@@ -231,6 +231,7 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     )
     os.makedirs(viz_path_specific, exist_ok=True)
 
+    # --- Prepare all display images (convert CHW to HWC, scale to 0-255 uint8) ---
     def prep_display_img(img_data_chw, is_mask=False): # Added is_mask for specific handling if needed
         if img_data_chw is None:
             ph_size = args_config.get("img_size", [64, 64])
@@ -252,6 +253,7 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
 
     if out_mask_chw_01 is not None:
         anomaly_map_raw_hw = out_mask_chw_01[0] # This is the raw score map (H,W)
+        
         anomaly_map_smoothed_hw = gaussian_filter(anomaly_map_raw_hw, sigma=args_config.get("viz_gaussian_sigma", 4))
         anomaly_map_normalized_hw = min_max_norm(anomaly_map_smoothed_hw)
         
@@ -260,7 +262,8 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
             raw_for_blend_hwc = cv2.cvtColor(raw_for_blend_hwc, cv2.COLOR_GRAY2RGB)
         heatmap_on_image_disp_hwc = show_cam_on_image(raw_for_blend_hwc, anomaly_map_normalized_hw)
 
-        binary_prediction_mask_hw = (anomaly_map_raw_hw >= optimal_pixel_threshold).astype(np.uint8) * 255
+        # Apply threshold to the raw anomaly map to get the binary prediction
+        binary_prediction_mask_hw = (anomaly_map_raw_hw >= pixel_threshold_for_viz).astype(np.uint8) * 255
         out_mask_disp_hw = binary_prediction_mask_hw # This is the key change
 
     else:
@@ -284,13 +287,14 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     ]
     plot_cmaps_row1 = [None, "gray", None, None, None]
 
-    plot_titles_row2 = ["Heatmap Overlay", "Predicted Mask (Binary)", "recon_normal", "recon_noisier", "recon_con"]
+    plot_titles_row2 = ["Heatmap Overlay", f"Predicted Mask (Thresh={pixel_threshold_for_viz:.4f})", "recon_normal", "recon_noisier", "recon_con"]
     plot_data_row2 = [
         heatmap_on_image_disp_hwc, out_mask_disp_hw, recon_normal_disp_hwc,
         recon_noisier_disp_hwc, recon_con_disp_hwc
     ]
     plot_cmaps_row2 = [None, "gray", None, None, None]
 
+    # --- Modified fig creation and layout ---
     fig, axes = plt.subplots(2, 5, figsize=(15, 7.2), constrained_layout=True)
     fig.suptitle(f'Class: {sub_class_name} - Img: {os.path.basename(image_path_str)} - Score: {image_score_val:.4f}', fontsize=10)
 
@@ -315,10 +319,31 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     plt.savefig(savename_full)
     plt.close(fig)
 
+
 def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_model, loss_fn, sub_class_name, class_type_str, checkpoint_type, device):
     
     normal_t_eval = args_config["eval_normal_t"]
     noisier_t_eval = args_config["eval_noisier_t"]
+    
+    # 掩码相关参数
+    use_masked_diffusion = args_config.get('use_masked_diffusion', False)
+    mask_threshold = args_config.get('mask_threshold', 0.1)
+    mask_blur_radius = args_config.get('mask_blur_radius', 5.0)
+    mask_smooth_radius = args_config.get('mask_smooth_radius', 5.0)
+    
+    # 初始化掩码生成器（如果启用）
+    mask_generator = None
+    if use_masked_diffusion:
+        try:
+            from models.mask_generator import DynamicMaskGenerator
+            mask_generator = DynamicMaskGenerator(
+                threshold=mask_threshold,
+                blur_radius=mask_blur_radius
+            ).to(device)
+            print(f"使用Masked Diffusion进行评估 (阈值={mask_threshold}, 模糊半径={mask_blur_radius})")
+        except ImportError:
+            print("警告: 无法导入DynamicMaskGenerator，将禁用Masked Diffusion")
+            use_masked_diffusion = False
     
     # Setup DDPM sampler
     in_channels_ddpm = args_config["channels"]
@@ -338,6 +363,10 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
     all_pixel_preds_list = [] # List of 2D predicted score maps
     viz_data_list = [] # List to store data for visualization
     
+    # 如果使用掩码扩散，存储掩码信息用于可视化
+    if use_masked_diffusion:
+        all_masks_list = []
+    
     unet_model.eval()
     seg_model.eval()
     
@@ -349,7 +378,6 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
             pixel_mask_gt = sample["mask"].to(device) # (B, 1, H, W)
             image_path_info = sample.get("file_name", f"unknown_image_{i}") # Get filepath for saving viz
             if isinstance(image_path_info, list): image_path_info = image_path_info[0]
-
 
             # --- Current Features (for testing) ---
             if 'current_features' in sample and sample['current_features'] is not None:
@@ -365,11 +393,35 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
             normal_t_batch = torch.tensor([normal_t_eval], device=device).repeat(batch_size_current)
             noisier_t_batch = torch.tensor([noisier_t_eval], device=device).repeat(batch_size_current)
             
-            # DDPM inference to get reconstructed image
-            eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, \
-            x_norm_t, x_nois_t, pred_x_t_nois = ddpm_sampler.norm_guided_one_step_denoising_eval(
-                unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch, args_config, current_features
-            )
+            # 如果使用掩码扩散，需要两次重建
+            if use_masked_diffusion:
+                # 第一次标准重建，用于生成掩码
+                _, initial_recon, _, _, _, _, _ = ddpm_sampler.norm_guided_one_step_denoising_eval(
+                    unet_model, aligner_model, loss_fn, image_tensor, 
+                    normal_t_batch, noisier_t_batch, args_config, current_features
+                )
+                
+                # 使用掩码生成器基于重建差异生成掩码
+                anomaly_mask = mask_generator(image_tensor, initial_recon)
+                
+                # 存储掩码用于可视化
+                for b_idx in range(batch_size_current):
+                    all_masks_list.append(anomaly_mask[b_idx].cpu().numpy())
+                
+                # 第二次带掩码引导的重建
+                eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, x_normal_t, x_noiser_t, pred_x_t_nois = \
+                    ddpm_sampler.norm_guided_one_step_denoising_eval(
+                        unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch,
+                        args_config, current_features, mask=anomaly_mask, 
+                        mask_smooth_radius=mask_smooth_radius, use_mask=True
+                    )
+            else:
+                # 标准重建（不使用掩码）
+                eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, x_normal_t, x_noiser_t, pred_x_t_nois = \
+                    ddpm_sampler.norm_guided_one_step_denoising_eval(
+                        unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch,
+                        args_config, current_features
+                    )
             
             # Segmentation model inference
             seg_input_tensor = torch.cat((image_tensor, pred_x_0_cond), dim=1)
@@ -403,15 +455,14 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
                     "out_mask_chw_01": pred_anomaly_map[0].cpu().numpy(),
                     "pred_x_0_condition_chw_01": pred_x_0_cond[0].cpu().numpy(),
                     "image_score_val": current_image_score[0].item(),
-                    "x_normal_t_chw_01": x_norm_t[0].cpu().numpy() if x_norm_t is not None else None,
-                    "x_noiser_t_chw_01": x_nois_t[0].cpu().numpy() if x_nois_t is not None else None,
+                    "x_normal_t_chw_01": x_normal_t[0].cpu().numpy() if x_normal_t is not None else None,
+                    "x_noiser_t_chw_01": x_noiser_t[0].cpu().numpy() if x_noiser_t is not None else None,
                     "pred_x_t_noisier_chw_01": pred_x_t_nois[0].cpu().numpy() if pred_x_t_nois is not None else None,
                     "pred_x_0_normal_chw_01": pred_x_0_norm[0].cpu().numpy() if pred_x_0_norm is not None else None,
                     "pred_x_0_noisier_chw_01": pred_x_0_nois[0].cpu().numpy() if pred_x_0_nois is not None else None,
                 }
                 viz_data_list.append(viz_data)
-
-    # --- Calculate final metrics ---
+    # --- Calculate final metrics and create visualizations ---
     all_image_scores_np = np.array(all_image_scores)
     all_image_labels_np = np.array(all_image_labels)
     
@@ -519,7 +570,7 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
         print("Pixel metrics skipped: No pixel ground truth or predictions available.")
 
     if args_config.get("save_visualizations_eval", True) and viz_data_list:
-        print(f"Generating visualizations with optimal pixel threshold: {optimal_threshold_px:.4f}...")
+        print(f"Generating visualizations with 99th percentile pixel threshold: {optimal_threshold_px:.4f}...")
         for data in tqdm(viz_data_list, desc="Saving visualizations"):
             save_visualizations(
                 image_path_str=data["image_path_info"],
@@ -531,7 +582,8 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
                 sub_class_name=sub_class_name,
                 checkpoint_type=checkpoint_type,
                 image_score_val=data["image_score_val"],
-                optimal_pixel_threshold=optimal_threshold_px, # Pass the calculated threshold
+                # MODIFIED: Pass the calculated 99th percentile threshold
+                pixel_threshold_for_viz=optimal_threshold_px,
                 x_normal_t_chw_01=data["x_normal_t_chw_01"],
                 x_noiser_t_chw_01=data["x_noiser_t_chw_01"],
                 pred_x_t_noisier_chw_01=data["pred_x_t_noisier_chw_01"],

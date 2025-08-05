@@ -5,6 +5,72 @@ import torch
 import torchvision.transforms as T
 import torch.nn.functional as F
 
+def custom_gaussian_blur(x, kernel_size, sigma):
+    """
+    自定义高斯模糊实现，不依赖torchvision
+    
+    Args:
+        x: 输入张量 [B, C, H, W]
+        kernel_size: 高斯核大小
+        sigma: 高斯核标准差
+    """
+    # 确保kernel_size是奇数
+    if kernel_size % 2 == 0:
+        kernel_size = kernel_size + 1
+    
+    # 计算一维高斯核
+    channels = x.shape[1]
+    kernel_size = [kernel_size, kernel_size]
+    sigma = [sigma, sigma]
+    
+    # 计算高斯核
+    meshgrids = torch.meshgrid([torch.arange(size, device=x.device, dtype=torch.float32) for size in kernel_size], indexing='ij')
+    
+    # 中心点坐标
+    center = [(size - 1) / 2 for size in kernel_size]
+    
+    # 计算二维高斯核
+    gauss = torch.ones(1, device=x.device)
+    for grid, sigma_value, center_value in zip(meshgrids, sigma, center):
+        gauss = gauss * torch.exp(-((grid - center_value) / sigma_value) ** 2 / 2)
+    
+    # 归一化高斯核
+    gauss = gauss / gauss.sum()
+    
+    # 扩展到所需维度 [1, 1, kernel_size, kernel_size]
+    gauss = gauss.view(1, 1, kernel_size[0], kernel_size[1])
+    gauss = gauss.repeat(channels, 1, 1, 1)
+    
+    # 创建卷积层
+    pad_size = kernel_size[0] // 2
+    padding = [pad_size, pad_size]
+    
+    # 对每个通道单独做卷积
+    result = []
+    for c in range(channels):
+        channel = x[:, c:c+1, :, :]  # [B, 1, H, W]
+        blurred = F.conv2d(channel, gauss[c:c+1], padding=padding, groups=1)
+        result.append(blurred)
+        
+    return torch.cat(result, dim=1)
+
+def create_smooth_mask(binary_mask, smooth_radius=5.0):
+    """
+    将二值掩码转换为平滑过渡的软掩码
+    Args:
+        binary_mask: 二值掩码张量 (B, 1, H, W)
+        smooth_radius: 平滑半径
+    Returns:
+        soft_mask: 平滑过渡的软掩码 (B, 1, H, W)
+    """
+    # 使用自定义高斯模糊创建平滑过渡
+    kernel_size = int(2 * smooth_radius) + 1
+    soft_mask = custom_gaussian_blur(binary_mask, kernel_size, smooth_radius)
+    
+    # 确保值在0-1之间
+    soft_mask = torch.clamp(soft_mask, 0, 1)
+    return soft_mask
+
 def get_beta_schedule(num_diffusion_steps, name="cosine"):
     betas = []
     if name == "cosine":
@@ -234,7 +300,7 @@ class GaussianDiffusionModel:
             "pred_x_0":     pred_x_0,
             }
 
-    def sample_p(self, model, x_t, t, current_features, denoise_fn_name="gauss"): # Added current_features, renamed denoise_fn
+    def sample_p(self, model, x_t, t, current_features, denoise_fn_name="gauss"): # Added current_features
         out = self.p_mean_variance(model, x_t, t, current_features) # Pass current_features
         
         if denoise_fn_name == "gauss": # Assuming denoise_fn_name refers to the noise sampling strategy
@@ -252,46 +318,109 @@ class GaussianDiffusionModel:
         sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_x_0": out["pred_x_0"]}
 
+    def masked_p_sample(self, model, x_t, t, current_features, mask=None, mask_smooth_radius=5.0, denoise_fn_name="gauss"):
+        """
+        带掩码的单步去噪过程
+        
+        Args:
+            model: 模型
+            x_t: 噪声图像
+            t: 时间步
+            current_features: 当前特征
+            mask: 掩码，1表示要重建区域，0表示保留原始区域
+            mask_smooth_radius: 掩码边界平滑半径
+            denoise_fn_name: 去噪函数名称
+        """
+        # 如果没有提供掩码，则使用标准去噪
+        if mask is None:
+            return self.sample_p(model, x_t, t, current_features, denoise_fn_name)
+        
+        # 标准去噪步骤
+        out = self.p_mean_variance(model, x_t, t, current_features)
+        
+        # 噪声采样
+        if denoise_fn_name == "gauss":
+            noise = torch.randn_like(x_t)
+        else:
+            raise NotImplementedError(f"denoise_fn {denoise_fn_name} not implemented for masked_p_sample")
+        
+        nonzero_mask = ((t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1))))
+        
+        # 计算下一步
+        next_sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+        
+        # 创建平滑过渡的掩码
+        if mask_smooth_radius > 0:
+            smooth_mask = create_smooth_mask(mask, smooth_radius=mask_smooth_radius)
+        else:
+            smooth_mask = mask
+        
+        # 应用掩码：在掩码区域应用标准去噪，在非掩码区域保持原样
+        masked_sample = next_sample * smooth_mask + x_t * (1 - smooth_mask)
+        
+        return {"sample": masked_sample, "pred_x_0": out["pred_x_0"]}
+
     def forward_backward( # This method seems for full sampling, ensure current_features are handled if used.
-            self, model, x, current_features, see_whole_sequence="half", t_distance=None, denoise_fn_name="gauss",
+            self, model, x, current_features, see_whole_sequence="half", t_distance=None, 
+            denoise_fn_name="gauss", mask=None, mask_smooth_radius=5.0, use_mask=False
             ):
+        """
+        完整的前向加噪和后向去噪过程，支持掩码
+        
+        Args:
+            model: UNet模型
+            x: 输入图像
+            current_features: 当前特征
+            see_whole_sequence: 是否返回完整序列，可选"whole", "half", None
+            t_distance: 扩散步数
+            denoise_fn_name: 去噪函数名称
+            mask: 掩码，1表示要重建区域，0表示保留原始区域
+            mask_smooth_radius: 掩码平滑半径
+            use_mask: 是否使用掩码逻辑
+        """
         assert see_whole_sequence in ["whole", "half", None]
 
         if t_distance == 0:
             return x.detach()
 
         if t_distance is None:
-            t_distance = self.num_timesteps # Default to full num_timesteps
+            t_distance = self.num_timesteps
 
-        img_seq = [x.cpu().detach()] # Store sequence of images
+        img_seq = [x.cpu().detach()]
 
-        # Forward process (noising)
-        if see_whole_sequence == "whole": # Diffuse step-by-step
+        # 前向过程（加噪）
+        if see_whole_sequence == "whole":
             current_x_t = x
             for t_step in range(t_distance):
                 t_batch = torch.tensor([t_step], device=x.device).repeat(x.shape[0])
-                noise = self.noise_fn(current_x_t, t_batch).float() # Use noise_fn for forward diffusion
-                current_x_t = self.sample_q_gradual(current_x_t, t_batch, noise) # q(x_t | x_{t-1})
+                noise = self.noise_fn(current_x_t, t_batch).float()
+                current_x_t = self.sample_q_gradual(current_x_t, t_batch, noise)
                 img_seq.append(current_x_t.cpu().detach())
             x_noised = current_x_t
-        else: # Diffuse in one step to t_distance
+        else:
             t_tensor = torch.tensor([t_distance - 1], device=x.device).repeat(x.shape[0])
             noise = self.noise_fn(x, t_tensor).float()
-            x_noised = self.sample_q(x, t_tensor, noise) # q(x_t | x_0)
+            x_noised = self.sample_q(x, t_tensor, noise)
             if see_whole_sequence == "half":
                 img_seq.append(x_noised.cpu().detach())
 
-        # Backward process (denoising)
+        # 后向过程（去噪）
         current_x_t = x_noised
-        for t_step in range(t_distance - 1, -1, -1): # From T-1 down to 0
+        for t_step in range(t_distance - 1, -1, -1):
             t_batch = torch.tensor([t_step], device=x.device).repeat(x.shape[0])
             with torch.no_grad():
-                out = self.sample_p(model, current_x_t, t_batch, current_features, denoise_fn_name=denoise_fn_name)
+                if use_mask and mask is not None:
+                    out = self.masked_p_sample(
+                        model, current_x_t, t_batch, current_features, 
+                        mask=mask, mask_smooth_radius=mask_smooth_radius,
+                        denoise_fn_name=denoise_fn_name
+                    )
+                else:
+                    out = self.sample_p(model, current_x_t, t_batch, current_features, denoise_fn_name=denoise_fn_name)
                 current_x_t = out["sample"]
-            if see_whole_sequence: # "whole" or "half" (if half, only last step is added here)
+            if see_whole_sequence:
                 img_seq.append(current_x_t.cpu().detach())
         
-        # If not seeing whole sequence, return only the final denoised sample
         return current_x_t.detach() if not see_whole_sequence else img_seq
 
 
@@ -355,7 +484,8 @@ class GaussianDiffusionModel:
         return loss_dict, x_t, estimate_noise # Return loss_dict, x_t, and predicted noise
 
    
-    def norm_guided_one_step_denoising(self, model, x_0, anomaly_label, args, current_features): # Added current_features
+    def norm_guided_one_step_denoising(self, model, x_0, anomaly_label, args, current_features, 
+                                   mask=None, mask_smooth_radius=5.0, use_mask=False): # Added current_features
         # two-scale t
         # Ensure current_features batch size matches x_0.shape[0]
         batch_size = x_0.shape[0]
@@ -393,48 +523,94 @@ class GaussianDiffusionModel:
         estimate_noise_hat = estimate_noise_normal - guidance_term # This is ε̂_θ(x_normal_t, t_normal, c)
         
         pred_x_0_norm_guided = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
+        
+        # 添加掩码逻辑
+        if use_mask and mask is not None:
+            # 创建平滑过渡的掩码
+            if mask_smooth_radius > 0:
+                smooth_mask = create_smooth_mask(mask, smooth_radius=mask_smooth_radius)
+            else:
+                smooth_mask = mask
+                
+            # 应用掩码：掩码区域使用引导重建，非掩码区域保留原始图像
+            pred_x_0_norm_guided = pred_x_0_norm_guided * smooth_mask + x_0 * (1 - smooth_mask)
 
         return loss, pred_x_0_norm_guided, normal_t, x_normal_t, x_noiser_t # Returning scalar loss
 
 
-    def norm_guided_one_step_denoising_eval(self, model, aligner, loss_fn, x_0, normal_t, noisier_t, args, current_features): # Added current_features
-        # normal_t and noisier_t are tensors here, already batched.
+    def norm_guided_one_step_denoising_eval(self, model, aligner, loss_fn, x_0, normal_t, noisier_t, args, 
+                                       current_features, mask=None, mask_smooth_radius=5.0, use_mask=False):
+        """
+        带掩码的引导去噪过程（评估阶段）
+        
+        Args:
+            model: UNet模型
+            aligner: 对齐模型
+            loss_fn: 损失函数
+            x_0: 输入图像
+            normal_t: 正常时间步
+            noisier_t: 更嘈杂时间步
+            args: 参数
+            current_features: 当前特征
+            mask: 掩码，1表示要重建区域，0表示保留原始区域
+            mask_smooth_radius: 掩码平滑半径
+            use_mask: 是否使用掩码逻辑
+        """
         batch_size = x_0.shape[0]
 
-        # Assuming current_features are passed and match batch_size
+        # 计算损失和噪声预测
         normal_loss_dict, x_normal_t, estimate_noise_normal = self.calc_loss(model, x_0, normal_t, current_features)
         noisier_loss_dict, x_noiser_t, estimate_noise_noisier = self.calc_loss(model, x_0, noisier_t, current_features)
 
         pred_x_0_noisier = self.predict_x_0_from_eps(x_noiser_t, noisier_t, estimate_noise_noisier).clamp(-1, 1)
         
-        # See note in norm_guided_one_step_denoising about using estimate_noise_normal here
         noise_for_pred_x_t_noisier = estimate_noise_normal 
         pred_x_t_noisier = self.sample_q(pred_x_0_noisier, normal_t, noise_for_pred_x_t_noisier)    
 
-        # In evaluation, loss is typically not filtered by anomaly_label.
-        loss = (normal_loss_dict["loss"] + noisier_loss_dict["loss"]).mean() # Average over batch
+        loss = (normal_loss_dict["loss"] + noisier_loss_dict["loss"]).mean()
 
-        # Reconstruction without guidance (standard DDPM prediction from x_normal_t)
+        # 不使用掩码的标准重建
         pred_x_0_normal = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_normal).clamp(-1, 1)
         
-        # Guided reconstruction
+        # 引导重建
         guidance_scale = extract(self.sqrt_one_minus_alphas_cumprod, normal_t, x_0.shape, x_0.device) * args["condition_w"]
         guidance_term = guidance_scale * (pred_x_t_noisier - x_normal_t)
         estimate_noise_hat = estimate_noise_normal - guidance_term
         
-        pred_x_0_norm_guided = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
+        # 计算引导后的重建结果
+        pred_x_0_norm_guided_standard = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
+        
+        # 如果使用掩码，应用掩码
+        if use_mask and mask is not None:
+            # 创建平滑过渡的掩码
+            if mask_smooth_radius > 0:
+                smooth_mask = create_smooth_mask(mask, smooth_radius=mask_smooth_radius)
+            else:
+                smooth_mask = mask
+                
+            # 应用掩码：掩码区域使用引导重建，非掩码区域保留原始图像
+            pred_x_0_norm_guided = pred_x_0_norm_guided_standard * smooth_mask + x_0 * (1 - smooth_mask)
+        else:
+            pred_x_0_norm_guided = pred_x_0_norm_guided_standard
+        
+        # 原有的对齐优化逻辑
         with torch.enable_grad():
             z_0 = pred_x_0_norm_guided.clone().detach().requires_grad_(True)
 
             for i in range(50):
                 z, c = aligner(z_0, current_features)
-                loss = loss_fn(z, c)
-                grad = torch.autograd.grad(loss, z_0)[0]
+                loss_align = loss_fn(z, c)
+                grad = torch.autograd.grad(loss_align, z_0)[0]
                 
-                z_0 = (z_0.detach() - grad).requires_grad_(True)
+                if use_mask and mask is not None:
+                    z_0 = (z_0.detach() * smooth_mask - grad + z_0.detach() * (1 - smooth_mask)).requires_grad_(True)
+                else:
+                    z_0 = (z_0.detach() - grad).requires_grad_(True)
+                
         pred_x_0_norm_guided = z_0.detach()
-        return loss, pred_x_0_norm_guided, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier  
-    
+        
+        return loss, pred_x_0_norm_guided, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier
+
 
     def noise_t(self, model, x_0, t, args, current_features): # Added current_features and args (if needed by calc_loss indirectly)
         # This method seems simpler, directly calculating loss and predicting x0 from a single t
