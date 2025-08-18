@@ -426,7 +426,7 @@ class GaussianDiffusionModel:
         with torch.enable_grad():
             z_0 = pred_x_0_norm_guided.clone().detach().requires_grad_(True)
 
-            for i in range(50):
+            for i in range(100):
                 z, c = aligner(z_0, current_features)
                 loss = loss_fn(z, c)
                 grad = torch.autograd.grad(loss, z_0)[0]

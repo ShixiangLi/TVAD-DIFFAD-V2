@@ -16,6 +16,7 @@ from data.dataset_beta_thresh import (
 from math import exp
 import torch.nn.functional as F
 from models.DDPM import GaussianDiffusionModel, get_beta_schedule
+from models.vae import AutoencoderKL
 from sklearn.metrics import roc_auc_score
 import pandas as pd
 from collections import defaultdict
@@ -58,8 +59,8 @@ class BinaryFocalLoss(nn.Module):
             return F_loss
 
 def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_class, class_type, device, 
-          unet_model, seg_model, aligner, loss_fn, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch=0):
-   
+          unet_model, seg_model, aligner, vae_model, loss_fn, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch=0):
+
     in_channels = args["channels"]
     betas = get_beta_schedule(args['T'], args['beta_schedule'])
     
@@ -85,7 +86,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
     
     if start_epoch > 0:
         print(f"Evaluating loaded model from epoch {start_epoch} before continuing training...")
-        best_image_auroc, best_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, data_len, sub_class, device)
+        best_image_auroc, best_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, aligner, vae_model, loss_fn, data_len, sub_class, device)
         best_combined_auroc = best_image_auroc + best_pixel_auroc
         print(f"Loaded model performance - Image AUROC: {best_image_auroc:.2f}, Pixel AUROC: {best_pixel_auroc:.2f}")
 
@@ -111,10 +112,15 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
                  print("Warning: 'current_features' not found in sample. Using dummy tensor.")
                  current_features = torch.randn(aug_image.shape[0], 24, 3, device=device) 
 
+            posterior = vae_model.encode(aug_image)
+            z = posterior.sample()
+
             noise_loss_val, pred_x0, normal_t, x_normal_t, x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(
-                unet_model, aug_image, anomaly_label, args, current_features
+                unet_model, z, anomaly_label, args, current_features
             )
-            
+
+            pred_x0 = vae_model.decode(pred_x0)
+
             seg_input = torch.cat((aug_image, pred_x0), dim=1)
             pred_mask = seg_model(seg_input) 
 
@@ -146,7 +152,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
         scheduler_seg.step()
 
         if (epoch + 1) % args.get("eval_every_epochs", 10) == 0:
-            temp_image_auroc, temp_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, data_len, sub_class, device)
+            temp_image_auroc, temp_pixel_auroc = eval(testing_dataset_loader, args, unet_model, seg_model, aligner, vae_model, loss_fn, data_len, sub_class, device)
 
             current_combined_auroc = temp_image_auroc + temp_pixel_auroc
             if current_combined_auroc >= best_combined_auroc:
@@ -175,10 +181,11 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len, sub_c
     print(f"Training summary saved to {csv_filename}")
 
 
-def eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, data_len, sub_class, device):
+def eval(testing_dataset_loader, args, unet_model, seg_model, aligner, vae_model, loss_fn, data_len, sub_class, device):
     unet_model.eval()
     seg_model.eval()
-    
+    vae_model.eval()
+
     in_channels = args["channels"]
     betas = get_beta_schedule(args['T'], args['beta_schedule'])
 
@@ -207,12 +214,17 @@ def eval(testing_dataset_loader, args, unet_model, seg_model, aligner, loss_fn, 
             else:
                  current_features = torch.randn(image.shape[0], 24, 3, device=device) 
 
-            normal_t_tensor = torch.tensor([args["eval_normal_t"]], device=image.device).repeat(image.shape[0])
-            noisier_t_tensor = torch.tensor([args["eval_noisier_t"]], device=image.device).repeat(image.shape[0])
-            
+            posterior = vae_model.encode(image)
+            z = posterior.sample()
+
+            normal_t_tensor = torch.tensor([args["eval_normal_t"]], device=z.device).repeat(z.shape[0])
+            noisier_t_tensor = torch.tensor([args["eval_noisier_t"]], device=z.device).repeat(z.shape[0])
+
             _, pred_x_0_condition, _, _, _, _, _ = ddpm_sample.norm_guided_one_step_denoising_eval(
-                unet_model, aligner, loss_fn, image, normal_t_tensor, noisier_t_tensor, args, current_features
+                unet_model, aligner, loss_fn, z, normal_t_tensor, noisier_t_tensor, args, current_features
             )
+            
+            pred_x_0_condition = vae_model.decode(pred_x_0_condition)
             
             seg_input_eval = torch.cat((image, pred_x_0_condition), dim=1)
             pred_mask_seg = seg_model(seg_input_eval)
@@ -361,16 +373,22 @@ def main():
         test_data_len = len(testing_dataset) 
         
         in_channels = args["channels"]
-        
+        latent_channels = args["latent_channels"]
+
         unet_model = UNetModel(
-            img_size=args['img_size'], base_channels=args['base_channels'], 
-            channel_mults=args.get('channel_mults', ""), dropout=args["dropout"], 
-            n_heads=args["num_heads"], n_head_channels=args["num_head_channels"],
-            attention_resolutions=args["attention_resolutions"], in_channels=in_channels,
+            img_size=args['latent_size'], 
+            base_channels=args['base_channels'], 
+            channel_mults=args.get('channel_mults', ""), 
+            dropout=args["dropout"], 
+            n_heads=args["num_heads"], 
+            n_head_channels=args["num_head_channels"],
+            attention_resolutions=args["attention_resolutions"], 
+            in_channels=latent_channels,
         ).to(device)
 
         seg_model = SegmentationSubNetwork(
-            in_channels=in_channels * 2, out_channels=1
+            in_channels=in_channels * 2, 
+            out_channels=1
         ).to(device)
         
         aligner_model = Aligner(
@@ -380,6 +398,10 @@ def main():
         aligner_model.load_state_dict(torch.load(args['aligner']['model_path'], map_location=device))
         aligner_model.eval()
         loss_fn = HardNegativeContrastiveLoss(temperature=args['aligner']['temperature'], top_k=args['aligner']['hard_negative_top_k']).to(device)
+
+        vae_model = AutoencoderKL(embed_dim=8, ch_mult=[1, 1, 2]).to(device)
+        vae_model.load_state_dict(torch.load(args['vae_model_path'], map_location=device))
+        vae_model.eval()
 
         optimizer_ddpm = optim.Adam(unet_model.parameters(), lr=args['diffusion_lr'], weight_decay=args['weight_decay'])
         optimizer_seg = optim.Adam(seg_model.parameters(), lr=args['seg_lr'], weight_decay=args['weight_decay'])
@@ -414,7 +436,7 @@ def main():
             print(f"未找到已保存的模型。将从 Epoch 1 开始全新训练。")
 
         train(training_loader, testing_loader, args, test_data_len, sub_class_name, class_type_str, device,
-              unet_model, seg_model, aligner_model, loss_fn, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch)
+              unet_model, seg_model, aligner_model, vae_model, loss_fn, optimizer_ddpm, optimizer_seg, scheduler_seg, start_epoch)
 
     print("\n--- All training sessions complete. ---")
 

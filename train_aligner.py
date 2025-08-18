@@ -8,6 +8,7 @@ import json
 from collections import defaultdict
 
 from models.aligner import ImageEncoder, CurrentEncoder, Aligner
+from models.vae import AutoencoderKL
 from data.dataset_beta_thresh import CustomTrainDataset
 
 def defaultdict_from_json(jsonDict):
@@ -51,7 +52,7 @@ def train(args, device):
     # 设置训练数据集和数据加载器
     train_dataset_path = os.path.join(args['custom_dataset_root_path'], args['custom_dataset_classes'][0])
     train_dataset = CustomTrainDataset(train_dataset_path, args['custom_dataset_classes'][0], args['img_size'], args)
-    train_loader = DataLoader(train_dataset, batch_size=args['Batch_Size'], shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=args['Batch_Size'], shuffle=True, num_workers=8, pin_memory=True)
 
     # 初始化模型、优化器和损失函数
     aligner_model = Aligner(
@@ -60,6 +61,10 @@ def train(args, device):
     ).to(device)
     optimizer = optim.Adam(aligner_model.parameters(), lr=args['learning_rate'])
     loss_fn = HardNegativeContrastiveLoss(temperature=args['temperature'], top_k=args['hard_negative_top_k']).to(device)
+
+    vae_model = AutoencoderKL(embed_dim=8, ch_mult=[1, 1, 2]).to(device)
+    vae_model.load_state_dict(torch.load(args['vae_model_path'], map_location=device))
+    vae_model.eval()
 
     start_epoch = 0
     best_train_loss = float('inf') # 使用训练损失作为评估依据
@@ -87,8 +92,11 @@ def train(args, device):
             images = batch['image'].to(device)
             currents = batch['current_features'].to(device)
 
+            posterior = vae_model.encode(images)
+            z = posterior.sample()
+
             optimizer.zero_grad()
-            image_embed, current_embed = aligner_model(images, currents)
+            image_embed, current_embed = aligner_model(z, currents)
             loss = loss_fn(image_embed, current_embed)
             
             if torch.isnan(loss):

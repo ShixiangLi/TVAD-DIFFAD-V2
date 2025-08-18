@@ -7,6 +7,7 @@ from scipy.ndimage import gaussian_filter
 import cv2
 from models.Recon_subnetwork import UNetModel
 from models.Seg_subnetwork import SegmentationSubNetwork
+from models.vae import AutoencoderKL
 # import torch.nn as nn # Duplicated
 from data.dataset_beta_thresh import (
     CustomTestDataset
@@ -315,8 +316,8 @@ def save_visualizations(image_path_str, raw_image_orig_chw_01, gt_mask_chw_01, o
     plt.savefig(savename_full)
     plt.close(fig)
 
-def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_model, loss_fn, sub_class_name, class_type_str, checkpoint_type, device):
-    
+def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_model, vae_model, loss_fn, sub_class_name, class_type_str, checkpoint_type, device):
+
     normal_t_eval = args_config["eval_normal_t"]
     noisier_t_eval = args_config["eval_noisier_t"]
     
@@ -350,26 +351,28 @@ def testing(testing_dataset_loader, args_config, unet_model, seg_model, aligner_
             image_path_info = sample.get("file_name", f"unknown_image_{i}") # Get filepath for saving viz
             if isinstance(image_path_info, list): image_path_info = image_path_info[0]
 
-
-            # --- Current Features (for testing) ---
             if 'current_features' in sample and sample['current_features'] is not None:
                  current_features = sample['current_features'].to(device)
             else:
                  # MODIFIED: Update placeholder shape
                  print("Warning: 'current_features' not found in test sample. Using dummy tensor.")
                  current_features = torch.randn(image_tensor.shape[0], 24, 3, device=device) 
-            # --- End Current Features ---
+
+            posterior = vae_model.encode(image_tensor)
+            z = posterior.sample()
 
             # Prepare timesteps for evaluation
-            batch_size_current = image_tensor.shape[0]
+            batch_size_current = z.shape[0]
             normal_t_batch = torch.tensor([normal_t_eval], device=device).repeat(batch_size_current)
             noisier_t_batch = torch.tensor([noisier_t_eval], device=device).repeat(batch_size_current)
             
             # DDPM inference to get reconstructed image
             eval_loss, pred_x_0_cond, pred_x_0_norm, pred_x_0_nois, \
             x_norm_t, x_nois_t, pred_x_t_nois = ddpm_sampler.norm_guided_one_step_denoising_eval(
-                unet_model, aligner_model, loss_fn, image_tensor, normal_t_batch, noisier_t_batch, args_config, current_features
+                unet_model, aligner_model, loss_fn, z, normal_t_batch, noisier_t_batch, args_config, current_features
             )
+
+            pred_x_0_cond = vae_model.decode(pred_x_0_cond)
             
             # Segmentation model inference
             seg_input_tensor = torch.cat((image_tensor, pred_x_0_cond), dim=1)
@@ -598,6 +601,7 @@ def main():
         print(f"Checkpoint epoch: {checkpoint_data.get('n_epoch', 'N/A')}")
         
         in_channels_model = args_config["channels"]
+        latent_channels = args_config["latent_channels"]
 
         # Initialize UNet model
         unet_model_eval = UNetModel(
@@ -608,7 +612,7 @@ def main():
             n_heads=args_config["num_heads"], 
             n_head_channels=args_config["num_head_channels"],
             attention_resolutions=args_config["attention_resolutions"],
-            in_channels=in_channels_model
+            in_channels=latent_channels
         ).to(device)
 
         # Initialize Segmentation model
@@ -621,14 +625,17 @@ def main():
             ImageEncoder(latent_dim=args_config['aligner']['latent_dim']),
             CurrentEncoder(latent_dim=args_config['aligner']['latent_dim'])
         ).to(device)
-        aligner_model.load_state_dict(torch.load(args_config['aligner']['model_path'], map_location=device))
-        aligner_model.eval()
+        
         loss_fn = HardNegativeContrastiveLoss(temperature=args_config['aligner']['temperature'], top_k=args_config['aligner']['hard_negative_top_k']).to(device)
+
+        vae_model = AutoencoderKL(embed_dim=8, ch_mult=[1, 1, 2]).to(device)        
 
         # Load state dicts from checkpoint
         try:
             unet_model_eval.load_state_dict(checkpoint_data["unet_model_state_dict"])
             seg_model_eval.load_state_dict(checkpoint_data["seg_model_state_dict"])
+            vae_model.load_state_dict(torch.load(args_config['vae_model_path'], map_location=device))
+            aligner_model.load_state_dict(torch.load(args_config['aligner']['model_path'], map_location=device))
         except KeyError as e:
             print(f"Error: Missing key in checkpoint_data for {sub_class_item}: {e}. Ensure checkpoint is valid.")
             continue
@@ -638,6 +645,8 @@ def main():
             
         unet_model_eval.eval() # Set to evaluation mode
         seg_model_eval.eval()
+        aligner_model.eval()
+        vae_model.eval()
 
         # Determine dataset type and path
         dataset_root_main = "" # Base path for the dataset type (e.g., MVTec root, VisA root)
@@ -676,7 +685,7 @@ def main():
         eval_output_base = os.path.join(args_config["output_path"], "metrics", f"ARGS={args_config['arg_num']}", sub_class_item)
         os.makedirs(eval_output_base, exist_ok=True)
 
-        testing(test_loader_current, args_config, unet_model_eval, seg_model_eval, aligner_model, loss_fn, 
+        testing(test_loader_current, args_config, unet_model_eval, seg_model_eval, aligner_model, vae_model, loss_fn, 
                 sub_class_item, class_type_name, checkpoint_type_to_load, device)
 
     print("\n--- All evaluations complete. ---")

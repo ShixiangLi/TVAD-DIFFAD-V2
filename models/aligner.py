@@ -53,7 +53,7 @@ class ImageEncoder(nn.Module):
     def __init__(self, base_channels=64, channel_mults=(1, 2, 4, 8), latent_dim=256):
         super().__init__()
         
-        layers = [nn.Conv2d(3, base_channels, 3, padding=1)]
+        layers = [nn.Conv2d(8, base_channels, 3, padding=1)]
         ch = base_channels
         
         for i, mult in enumerate(channel_mults):

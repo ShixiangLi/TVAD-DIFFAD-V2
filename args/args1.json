@@ -1,6 +1,8 @@
 {
   "img_size": [64, 64],
+  "latent_size": [16, 16],
   "channels": 3,
+  "latent_channels": 8,
   "Batch_Size": 64,
   "eval_batch_size": 64,
   "EPOCHS": 50,
@@ -55,6 +57,8 @@
   "random_slice": true,
   "save_imgs": true,
   "save_vids": false,
+
+  "vae_model_path": "outputs/vae/vae_simple.pth",
 
   "aligner":{
     "img_size": [64, 64],
